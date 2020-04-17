@@ -1,0 +1,178 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Webhook endpoint for Content-Security-Policy
+
+Resources:
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+        - arn:aws:iam::aws:policy/AmazonEventBridgeFullAccess
+
+  Api:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref AWS::StackName
+      Description: Webhook endpoint for Content-Security-Policy
+
+  MethodEventsPOST:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !GetAtt Api.RootResourceId
+      AuthorizationType: NONE
+      HttpMethod: POST
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Content-Type: true
+            method.response.header.Content-Length: true
+            method.response.header.Cache-Control: true
+            method.response.header.Strict-Transport-Security: true
+            method.response.header.X-XSS-Protection: true
+            method.response.header.X-Content-Type-Options: true
+      Integration:
+        Credentials: !GetAtt ApiRole.Arn
+        IntegrationHttpMethod: ANY
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestParameters:
+          integration.request.path.object: context.requestId
+          integration.request.header.X-Amz-Target: "'AWSEvents.PutEvents'"
+          integration.request.header.Content-Type: "'application/x-amz-json-1.1'"
+        RequestTemplates:
+          application/json: !Sub |-
+            #set($original = $input.path('$'))
+            {
+              "Entries": [
+                {
+                  "Source": "content-security-policy",
+                  "EventBusName": "default",
+                  "Detail": "$input.json('$').replaceAll('\"','\\\"')",
+                  "DetailType": "content-security-policy"
+                }
+              ]
+            }
+        Type: AWS
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:events:action/PutEvents
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Cache-Control: "'no-cache, no-store, must-revalidate'"
+              method.response.header.Strict-Transport-Security: "'max-age=31536000; includeSubDomains'"
+              method.response.header.X-XSS-Protection: "'1; mode=block'"
+              method.response.header.X-Content-Type-Options: "'nosniff'"
+  
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+
+  ApiExecutionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub
+        - API-Gateway-Execution-Logs_${RestApi}/v1
+        - { RestApi: !Ref Api }
+      RetentionInDays: 7
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: MethodEventsPOST
+    Properties:
+      RestApiId: !Ref Api
+
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: ApiExecutionLogGroup
+    Properties:
+      RestApiId: !Ref Api
+      DeploymentId: !Ref ApiGatewayDeployment
+      StageName: v1
+
+  CatchAllLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: /aws/events/csp-report-policy-violation/CatchAll
+      RetentionInDays: 365
+
+  Notification:
+    Type: AWS::SNS::Topic
+    Properties:
+      Tags:
+        - Key: Name
+          Value: csp-report-policy-violation
+
+  NotificationPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties: 
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              AWS: !Ref AWS::AccountId
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: '*'
+      Topics:
+        - !Ref Notification
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: EventsCanStoreLogEvent
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt CatchAllLogGroup.Arn
+    
+  CatchAll: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: CSP violation reports
+      RoleArn: !GetAtt EventBridgeRole.Arn
+      EventPattern: 
+        source: 
+          - content-security-policy
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: !GetAtt CatchAllLogGroup.Arn
+          Id: content-security-policy-log    
+        - 
+          Arn: !Ref Notification
+          Id: content-security-policy-topic
+          InputTransformer:
+            InputPathsMap:
+              detail: $.detail
+            InputTemplate: '"{\"detail\":\"<detail>\"}"'
